@@ -37,7 +37,7 @@ if (-not (Test-Path $CurrentCsv)) {
 
 # Determine if AD changes will be applied
 $WillChangeAD = $NoWhatIf.IsPresent
-Write-Host "WillChangeAD = $WillChangeAD (false => simulation only)"
+Write-Host "WillChangeAD = $WillChangeAD (false => only logs, no AD changes)"
 
 # --- Helper: Normalize Records ---
 function Normalize-Records {
@@ -145,7 +145,7 @@ $curr = Import-CleanCsv -Path $CurrentCsv
 # 2) Define departments to skip
 $skipDepartments = @("Personal Training", "Maintenance", "Front Desk")
 
-# 3) Build hash tables keyed by 'Role' (used as EmployeeID) for offboarding
+# 3) Build hash tables keyed by 'Role' (used as EmployeeID)
 $prevHash = @{}
 foreach ($u in $prev) {
     if ($skipDepartments -contains $u.'Department Name') { continue }
@@ -155,7 +155,6 @@ foreach ($u in $prev) {
     }
 }
 
-# Build hash table for current CSV (for reference)
 $currHash = @{}
 foreach ($u in $curr) {
     if ($skipDepartments -contains $u.'Department Name') { continue }
@@ -165,7 +164,7 @@ foreach ($u in $curr) {
     }
 }
 
-# 4) Identify removed records (in previous but not in current)
+# 4) Identify removed records (present in previous but not in current)
 $removed = @()
 foreach ($key in $prevHash.Keys) {
     if (-not $currHash.ContainsKey($key)) {
@@ -173,15 +172,16 @@ foreach ($key in $prevHash.Keys) {
     }
 }
 
-# 5) Determine Onboarding Records (New vs. Rehire) by scanning all current CSV records.
+# 5) Determine onboarding records by scanning all current CSV records.
 $newAccounts = @()
 $rehireAccounts = @()
 foreach ($rec in $curr) {
     if ($skipDepartments -contains $rec.'Department Name') { continue }
     if (-not $rec.Role) { continue }
     if ($rec.Role.Length -eq 5) { $rec.Role = "0" + $rec.Role }
+    # Also filter out records that have empty First or Last Name.
+    if ([string]::IsNullOrWhiteSpace($rec.'First Name') -or [string]::IsNullOrWhiteSpace($rec.'Last Name')) { continue }
     $id = $rec.Role
-    # Lookup AD user using only employeeID (or employeeNumber)
     $adUser = Get-ADUser -Filter "(employeeID -eq '$id') -or (employeeNumber -eq '$id')" -Properties Enabled,SamAccountName,* -ErrorAction SilentlyContinue
     if (-not $adUser) {
         $newAccounts += $rec
@@ -287,19 +287,15 @@ if ($newAccounts.Count -gt 0) {
     Write-Host "`n--- ONBOARDING NEW ACCOUNTS ---"
     foreach ($a in $newAccounts) {
         $id = $a.Role
-        # Use Preferred First Name if available; otherwise, use First Name.
         $firstName = $a.'Preferred First Name'
-        if ([string]::IsNullOrWhiteSpace($firstName)) {
-            $firstName = $a.'First Name'
-        }
+        if ([string]::IsNullOrWhiteSpace($firstName)) { $firstName = $a.'First Name' }
         $lastName = $a.'Last Name'
-        # Construct email: remove spaces, lower-case.
+        # If either first or last name is still empty, skip the record.
+        if ([string]::IsNullOrWhiteSpace($firstName) -or [string]::IsNullOrWhiteSpace($lastName)) { continue }
         $emailLocal = ($firstName + "." + $lastName) -replace "\s", ""
         $email = "$emailLocal@corp.example.com"
-        # Construct Description: "Location Code - Job Title"
         $description = "$($a.'Location  Code') - $($a.'Job Title')"
         $samAccountName = $emailLocal.ToLower()
-        # Build hash table of attributes; Personal Email goes into extensionAttribute2.
         $userAttrs = @{
             employeeID          = $id
             mail                = $email
@@ -324,7 +320,6 @@ if ($newAccounts.Count -gt 0) {
                        -Path "OU=Users,DC=ad,DC=corp.example,DC=com" `
                        -OtherAttributes $userAttrs
             Write-Host "   New AD user created in default OU."
-            # Add to security group "sec00us-googleuser-sec"
             Add-ADGroupMember -Identity "sec00us-googleuser-sec" -Members $samAccountName -ErrorAction SilentlyContinue
             Write-Host "   Added to security group 'sec00us-googleuser-sec'."
         }
@@ -372,13 +367,13 @@ else {
     $nullArr | Export-Excel -Path $excelFile -WorksheetName "Rehires" -AutoSize -Title "Rehired/Existing Accounts" -Append
 }
 
-# RehireChangeLog
+# RehireChangeLog: Only export if there is data to avoid autosize errors.
 if ($global:RehireChangeLog.Count -gt 0) {
     $global:RehireChangeLog | Export-Excel -Path $excelFile -WorksheetName "RehireChanges" -AutoSize -Title "Before vs After" -Append
 }
 else {
     $nullArr = New-Object System.Collections.ArrayList
-    $nullArr | Export-Excel -Path $excelFile -WorksheetName "RehireChanges" -AutoSize -Title "No Rehire Changes" -Append
+    $nullArr | Export-Excel -Path $excelFile -WorksheetName "RehireChanges" -Title "No Rehire Changes" -Append
 }
 
 Write-Host "Export done => $excelFile"
