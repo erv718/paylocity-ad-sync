@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Sync AD users from Paylocity_Data_Latest.xlsx.
+    Sync AD users from Paylocity_Data_Latest.xlsx
 
 .DESCRIPTION
     • Reads only Paylocity_Data_Latest.xlsx (skips title/footer rows)
@@ -12,6 +12,8 @@
     • Handles missing/blank headers; trims; removes duplicates
     • Drops final “Report Total Records: N” footer
     • Default password = FirstInitial + LastInitial + “[company]” + last 4 of ID
+    • Places new users under Corporate vs. Clubs OUs based on Location Description
+    • Stores Personal Email in extensionAttribute2
 #>
 
 [CmdletBinding()]
@@ -26,8 +28,7 @@ Import-Module ImportExcel     -ErrorAction Stop
 
 Write-Host "Report => $Report"
 if (-not (Test-Path $Report)) {
-    Write-Error "Report not found: $Report"
-    return
+    Write-Error "Report not found: $Report"; return
 }
 
 $WillChangeAD = $Apply.IsPresent
@@ -65,7 +66,7 @@ function Import-CleanExcel {
         )
     )
 
-    # 2a) Import starting at row 2 (skip any title in row 1)
+    # 2a) Skip title row 1, treat row2 as headers
     $data = Import-Excel -Path $Path -StartRow 2 -ErrorAction SilentlyContinue
     $data = Normalize-Records -records $data
     if (-not $data.Count) { return @() }
@@ -127,7 +128,7 @@ function Order-Columns {
     return $data | Select-Object -Property $cols
 }
 
-# Desired column order for export
+# Desired column order
 $desiredOrder = @(
     "Role","Preferred First Name","First Name","Last Name",
     "Email","Personal Email","Mobile Phone",
@@ -137,13 +138,13 @@ $desiredOrder = @(
     "isexempt","issalaried","ishourly"
 )
 
-# Skip these depts entirely
+# Skip these depts
 $skipDepartments = @("Personal Training","Maintenance","Front Desk")
 
-# --- LOAD & CLEAN ----------------------------------------------------------
+# --- LOAD & CLEAN ---
 $data = Import-CleanExcel -Path $Report
 
-# 4) Validate row count if declared
+# 4) Validate row count
 if ($script:ReportTotalCount) {
     Write-Host ("Declared total: {0}" -f $script:ReportTotalCount)
     Write-Host ("Imported rows:  {0}" -f $data.Count)
@@ -152,26 +153,24 @@ if ($script:ReportTotalCount) {
     }
 }
 
-# 5) Classify into Removed / New / Rehire
+# 5) Classify
 $removedAccounts = @(); $newAccounts = @(); $rehireAccounts = @()
 foreach ($r in $data) {
     if ($skipDepartments -contains $r.'Department Name') { continue }
     if (-not $r.Role) { continue }
     if ($r.Role.Length -eq 5) { $r.Role = "0$r.Role" }
-    if ([string]::IsNullOrWhiteSpace($r.'First Name') -or [string]::IsNullOrWhiteSpace($r.'Last Name')) {
-        continue
-    }
+    if ([string]::IsNullOrWhiteSpace($r.'First Name') -or [string]::IsNullOrWhiteSpace($r.'Last Name')) { continue }
 
     switch ($r.status) {
         'T' { $removedAccounts   += $r }
         'A' {
-            $filter = "(employeeID -eq '$($r.Role)') -or (employeeNumber -eq '$($r.Role)')"
-            $u = Get-ADUser -Filter $filter -Properties Enabled -ErrorAction SilentlyContinue
+            $f  = "(employeeID -eq '$($r.Role)') -or (employeeNumber -eq '$($r.Role)')"
+            $u  = Get-ADUser -Filter $f -Properties Enabled -ErrorAction SilentlyContinue
             if (-not $u)             { $newAccounts    += $r }
             elseif (-not $u.Enabled) { $rehireAccounts += $r }
         }
         default {
-            Write-Host "[-] Unknown status '$($r.status)' for Role $($r.Role); skipping."
+            Write-Host "[-] Unknown status '$($r.status)' for Role $($r.Role). Skipping."
         }
     }
 }
@@ -180,8 +179,8 @@ foreach ($r in $data) {
 Write-Host "`n=== SUMMARY ==="
 Write-Host ("Terminated: {0}" -f $removedAccounts.Count)
 Write-Host ("New Accounts: {0} | Rehires: {1}" -f $newAccounts.Count, $rehireAccounts.Count)
-$adTxt = if ($WillChangeAD) { "YES" } else { "NO" }
-Write-Host ("AD changes? {0}" -f $adTxt)
+$adText = if ($WillChangeAD) { "YES" } else { "NO" }
+Write-Host ("AD changes? {0}" -f $adText)
 
 # 7) OFFBOARDING
 if ($removedAccounts.Count) {
@@ -191,8 +190,8 @@ if ($removedAccounts.Count) {
         Write-Host " - [$id] $fn $ln => disable/move in AD"
 
         $all = Get-ADUser -Filter "(employeeID -eq '$id') -or (employeeNumber -eq '$id')" `
-               -Properties SamAccountName,DistinguishedName,Enabled -ErrorAction SilentlyContinue
-        $act = $all | Where-Object { $_.Enabled }
+              -Properties SamAccountName,DistinguishedName,Enabled -ErrorAction SilentlyContinue
+        $act = $all | Where-Object { $_.Enabled -eq $true }
 
         switch ($act.Count) {
             1 {
@@ -201,12 +200,16 @@ if ($removedAccounts.Count) {
                     Disable-ADAccount -Identity $u.SamAccountName
                     Move-ADObject     -Identity $u.DistinguishedName `
                                       -TargetPath "OU=Users,OU=Disabled,OU=[Company],DC=ad,DC=corp.example,DC=com"
-                    (Get-ADUser -Identity $u.SamAccountName -Properties MemberOf).MemberOf |
-                      Where-Object { $_ -notlike "*Domain Users*" } |
-                      ForEach-Object { Remove-ADGroupMember -Identity $_ -Members $u.SamAccountName -Confirm:$false }
-                    Write-Host "   Disabled and moved."
+                    $groups = Get-ADUser -Identity $u.SamAccountName -Properties MemberOf |
+                              Select-Object -ExpandProperty MemberOf
+                    foreach ($dn in $groups) {
+                        if ($dn -notlike "*Domain Users*") {
+                            Remove-ADGroupMember -Identity $dn -Members $u.SamAccountName -Confirm:$false
+                        }
+                    }
+                    Write-Host "   Disabled & moved."
                 } else {
-                    Write-Host "   [Simulation] Would disable and move $($u.SamAccountName)."
+                    Write-Host "   [Simulation] Would disable & move $($u.SamAccountName)."
                 }
             }
             0 {
@@ -226,40 +229,40 @@ if ($rehireAccounts.Count) {
     Write-Host "`n--- REHIRES ---"
     foreach ($r in $rehireAccounts) {
         $id = $r.Role; $fn = $r.'First Name'; $ln = $r.'Last Name'
-        Write-Host " - [$id] $fn $ln => re-enable and update"
+        Write-Host " - [$id] $fn $ln => re-enable & update"
 
-        $filter = "(employeeID -eq '$id') -or (employeeNumber -eq '$id')"
-        $usr = Get-ADUser -Filter $filter -Properties Enabled,givenName,sn,title,department,mail `
+        $f   = "(employeeID -eq '$id') -or (employeeNumber -eq '$id')"
+        $usr = Get-ADUser -Filter $f -Properties Enabled,givenName,sn,title,department,mail `
                -ErrorAction SilentlyContinue
         if (-not $usr) {
-            Write-Warning "AD user not found for rehire"
+            Write-Warning -Message "AD user not found for rehire."
             continue
         }
 
         if ($WillChangeAD) {
             $before = Get-ADUser -Identity $usr.SamAccountName -Properties givenName,sn,title,department,mail
-            $after  = @{
+            $newH   = @{
                 givenName  = $fn
                 sn         = $ln
                 title      = $r.'Job Title'
                 department = $r.'Department Name'
                 mail       = $r.Email
             }
-            foreach ($k in $after.Keys) {
-                if ($before.$k -ne $after[$k]) {
+            foreach ($k in $newH.Keys) {
+                if ($before.$k -ne $newH[$k]) {
                     $global:RehireChangeLog += [PSCustomObject]@{
                         SamAccountName = $usr.SamAccountName
                         Attribute      = $k
                         Before         = $before.$k
-                        After          = $after[$k]
+                        After          = $newH[$k]
                     }
                 }
             }
             Enable-ADAccount -Identity $usr.SamAccountName
-            Set-ADUser       -Identity $usr.SamAccountName -Replace $after
-            Write-Host "   Re-enabled and updated."
+            Set-ADUser       -Identity $usr.SamAccountName -Replace $newH
+            Write-Host "   Re-enabled & updated."
         } else {
-            Write-Host "   [Simulation] Would re-enable and update."
+            Write-Host "   [Simulation] Would re-enable & update."
         }
     }
 } else {
@@ -278,29 +281,43 @@ if ($newAccounts.Count) {
         $desc  = "$($r.'Location  Code') - $($r.'Job Title')"
         $pw    = "{0}{1}[company]{2}" -f $fn[0], $ln[0], $id.Substring($id.Length-4)
 
-        Write-Host " - [$id] Create $sam ($fn $ln)"
-        if ($WillChangeAD) {
-            New-ADUser -Name             "$fn $ln" `
-                       -SamAccountName    $sam `
-                       -UserPrincipalName "$sam@ad.corp.example.com" `
-                       -GivenName         $fn `
-                       -Surname           $ln `
-                       -EmailAddress      $email `
-                       -MobilePhone       $r.'Mobile Phone' `
-                       -Description       $desc `
-                       -AccountPassword   (ConvertTo-SecureString $pw -AsPlainText -Force) `
-                       -Enabled           $true `
-                       -Path              "OU=Users,DC=ad,DC=corp.example,DC=com" `
-                       -OtherAttributes   @{
-                           employeeID          = $id
-                           title               = $r.'Job Title'
-                           department          = $r.'Department Name'
-                           extensionAttribute2 = $r.'Personal Email'
-                       }
-            Add-ADGroupMember -Identity "sec00us-googleuser-sec" -Members $sam -ErrorAction SilentlyContinue
-            Write-Host "   Created and group-member added."
+        # decide OU based on Location Description
+        if ($r.'Location Description' -eq 'Corporate') {
+            $ou = "OU=Users,OU=Corporate,OU=Locations,OU=[Company],DC=ad,DC=corp.example,DC=com"
         } else {
-            Write-Host "   [Simulation] Would create with password '$pw'."
+            $ou = "OU=Users,OU=Clubs,OU=Locations,OU=[Company],DC=ad,DC=corp.example,DC=com"
+        }
+
+        Write-Host " - [$id] $sam ($fn $ln) => create in $ou"
+        if ($WillChangeAD) {
+            try {
+                New-ADUser `
+                    -Name             "$fn $ln" `
+                    -SamAccountName    $sam `
+                    -UserPrincipalName "$sam@ad.corp.example.com" `
+                    -GivenName         $fn `
+                    -Surname           $ln `
+                    -EmailAddress      $email `
+                    -MobilePhone       $r.'Mobile Phone' `
+                    -Description       $desc `
+                    -AccountPassword   (ConvertTo-SecureString $pw -AsPlainText -Force) `
+                    -Enabled           $true `
+                    -Path              $ou `
+                    -OtherAttributes   @{ 
+                        employeeID          = $id
+                        title               = $r.'Job Title'
+                        department          = $r.'Department Name'
+                        extensionAttribute2 = $r.'Personal Email'
+                    }
+
+                Add-ADGroupMember -Identity "sec00us-googleuser-sec" -Members $sam -ErrorAction Stop
+                Write-Host "   Created & added to group."
+
+            } catch {
+                Write-Warning "   ✗ Failed to create ${sam}: $($_.Exception.Message)"
+            }
+        } else {
+            Write-Host "   [Simulation] Would create with password '$pw' in $ou."
         }
     }
 } else {
@@ -308,22 +325,24 @@ if ($newAccounts.Count) {
 }
 
 # 10) EXPORT
-$ts  = Get-Date -Format "yyyy-MM-dd_HH-mm"
+$ts = Get-Date -Format "yyyy-MM-dd_HH-mm"
 $out = "C:\Reports\SyncReport_$ts.xlsx"
 Write-Host "`n--- Exporting to $out ---"
 
-Order-Columns -data $removedAccounts   -Order $desiredOrder |
-  Export-Excel -Path $out -WorksheetName "Removed"         -AutoSize -Title "Removed Users"
-Order-Columns -data $newAccounts       -Order $desiredOrder |
-  Export-Excel -Path $out -WorksheetName "Added"           -AutoSize -Title "New Accounts"      -Append
-Order-Columns -data $rehireAccounts    -Order $desiredOrder |
-  Export-Excel -Path $out -WorksheetName "Rehires"         -AutoSize -Title "Rehired Accounts"  -Append
+Order-Columns -data $removedAccounts -Order $desiredOrder |
+    Export-Excel -Path $out -WorksheetName "Removed" -AutoSize -Title "Removed Users"
+
+Order-Columns -data $newAccounts -Order $desiredOrder |
+    Export-Excel -Path $out -WorksheetName "Added"   -AutoSize -Title "New Accounts" -Append
+
+Order-Columns -data $rehireAccounts -Order $desiredOrder |
+    Export-Excel -Path $out -WorksheetName "Rehires" -AutoSize -Title "Rehired/Existing" -Append
 
 if ($global:RehireChangeLog.Count) {
     $global:RehireChangeLog |
-      Export-Excel -Path $out -WorksheetName "RehireChanges" -AutoSize -Title "Before vs After" -Append
+        Export-Excel -Path $out -WorksheetName "RehireChanges" -AutoSize -Title "Before vs After" -Append
 } else {
     @() | Export-Excel -Path $out -WorksheetName "RehireChanges" -Title "No Rehire Changes" -Append
 }
 
-Write-Host "`nDone. Real AD changes applied? $WillChangeAD (false = simulation only)."
+Write-Host "`nDone. Real AD changes applied? $WillChangeAD (false = simulation only)."  
