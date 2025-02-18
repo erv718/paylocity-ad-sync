@@ -56,11 +56,6 @@ $global:ErrorLog = @()
 # Global duplicate log
 $global:DuplicateLog = @()
 
-# Security group distinguished names
-$groupGoogleUser        = "CN=sec00us-googleuser-sec,OU=Security Groups,OU=Corporate,OU=Locations,OU=[Company],DC=ad,DC=corp.example,DC=com"
-$groupLicenseEnterprise = "CN=sec00us-GoogleLicenseEnterpriseStandard-sec,OU=Security Groups,OU=Corporate,OU=Locations,OU=[Company],DC=ad,DC=corp.example,DC=com"
-$groupLicenseFrontline  = "CN=sec00us-GoogleLicenseFrontlineVault-sec,OU=Security Groups,OU=Corporate,OU=Locations,OU=[Company],DC=ad,DC=corp.example,DC=com"
-
 # 1) Normalize trim helper
 function Normalize-Records {
     param([array][AllowEmptyCollection()]$records)
@@ -304,10 +299,10 @@ if ($rehireAccounts.Count) {
             Enable-ADAccount -Identity $usr.SamAccountName
             Set-ADUser -Identity $usr.SamAccountName -Replace $newH
             if ($r.'Location Description' -eq 'Corporate') {
-                Add-ADGroupMember -Identity $groupLicenseEnterprise -Members $usr.SamAccountName -ErrorAction Stop
+                Add-ADGroupMember -Identity "sec00us-GoogleLicenseEnterpriseStandard-sec" -Members $usr.SamAccountName -ErrorAction Stop
                 Write-Host "   Added to sec00us-GoogleLicenseEnterpriseStandard-sec."
             } else {
-                Add-ADGroupMember -Identity $groupLicenseFrontline -Members $usr.SamAccountName -ErrorAction Stop
+                Add-ADGroupMember -Identity "sec00us-GoogleLicenseFrontlineVault-sec" -Members $usr.SamAccountName -ErrorAction Stop
                 Write-Host "   Added to sec00us-GoogleLicenseFrontlineVault-sec."
             }
             Write-Host "   Re-enabled & updated."
@@ -353,10 +348,6 @@ if ($Modify.IsPresent) {
                 displayName         = "$fn $ln"
             }
             # Always log new attribute values for report (even in simulation)
-            # Compute UPN from Preferred/FirstName.LastName for mail
-            $baseUpn = ("{0}.{1}" -f $fn,$ln).ToLower() -replace '[^a-z0-9\.]',''
-            if ($baseUpn.Length -gt 20) { $baseUpn = $baseUpn.Substring(0,20) }
-            $upn = $baseUpn
             $global:ModifyReport += [PSCustomObject]@{
                 SamAccountName     = $usr2.SamAccountName
                 FirstName          = $newH.givenName
@@ -372,17 +363,14 @@ if ($Modify.IsPresent) {
                 Description        = $newH.description
             }
             if ($WillChangeAD) {
-                # Apply all pending attribute changes
                 Set-ADUser -Identity $usr2.SamAccountName -Replace $newH
-                # If mail is missing in AD, set it from generated UPN
-                if (-not $usr2.mail) {
-                    $newMail = "$upn@corp.example.com"
-                    Set-ADUser -Identity $usr2.SamAccountName -EmailAddress $newMail -ErrorAction Stop
-                    Write-Host "   Set mail attribute => $newMail"
+                if ($r.'Location Description' -eq 'Corporate') {
+                    Add-ADGroupMember -Identity "sec00us-GoogleLicenseEnterpriseStandard-sec" -Members $usr2.SamAccountName -ErrorAction Stop
+                    Write-Host "   Added to sec00us-GoogleLicenseEnterpriseStandard-sec."
+                } else {
+                    Add-ADGroupMember -Identity "sec00us-GoogleLicenseFrontlineVault-sec" -Members $usr2.SamAccountName -ErrorAction Stop
+                    Write-Host "   Added to sec00us-GoogleLicenseFrontlineVault-sec."
                 }
-                # Ensure user is in the googleuser-sec group
-                Add-ADGroupMember -Identity $groupGoogleUser -Members $usr2.SamAccountName -ErrorAction SilentlyContinue
-                Write-Host "   Added to sec00us-googleuser-sec."
                 Write-Host "   Modified attributes."
             } else {
                 Write-Host "   [Simulation] Would modify attributes."
@@ -405,7 +393,6 @@ if ($newAccounts.Count) {
         if ($baseUpn.Length -gt 20) { $baseUpn = $baseUpn.Substring(0,20) }
         $upn = $baseUpn
         $basePreSam = ($fn.Substring(0,1) + $ln) -replace '[^a-zA-Z0-9]',''
-        $basePreSam = $basePreSam.ToLower()
         if ($basePreSam.Length -gt 20) { $basePreSam = $basePreSam.Substring(0,20) }
         $preSam = $basePreSam
         $psSuffix = 1
@@ -419,13 +406,13 @@ if ($newAccounts.Count) {
         # Generate last four of Role (or full ID if shorter)
         $start = [Math]::Max(0, $id.Length - 4)
         $last4 = $id.Substring($start)
-        $pw    = "{0}{1}@[company]{2}" -f $fn[0], $ln[0], $last4
+        $pw    = "{0}{1}[company]{2}" -f $fn[0], $ln[0], $last4
 
         # choose OU by Location Description
         if ($r.'Location Description' -eq 'Corporate') {
-            $ou = "OU=Users,OU=6999 - [Company] Head Office,OU=New York,OU=Corporate,OU=Locations,OU=[Company],DC=ad,DC=corp.example,DC=com"
+            $ou = "OU=Users,OU=Corporate,OU=[Company],DC=SANDBOX,DC=local"
         } else {
-            $ou = "OU=Users,OU=Clubs,OU=Locations,OU=[Company],DC=ad,DC=corp.example,DC=com"
+            $ou = "OU=Users,OU=Gym,OU=[Company],DC=SANDBOX,DC=local"
         }
 
         Write-Host " - [$id] UPN:$upn  sAMAccountName:$preSam ($fn $ln) => create in $ou"
@@ -452,13 +439,13 @@ if ($newAccounts.Count) {
                       departmentNumber   = $r.'Location  Code'
                       extensionAttribute2 = $r.'Personal Email'
                   }
-                  Add-ADGroupMember -Identity $groupGoogleUser -Members $preSam -ErrorAction Stop
+                  Add-ADGroupMember -Identity "sec00us-googleuser-sec" -Members $preSam -ErrorAction Stop
                   Write-Host "   Created & added to sec00us-googleuser-sec."
                   if ($r.'Location Description' -eq 'Corporate') {
-                      Add-ADGroupMember -Identity $groupLicenseEnterprise -Members $preSam -ErrorAction Stop
+                      Add-ADGroupMember -Identity "sec00us-GoogleLicenseEnterpriseStandard-sec" -Members $preSam -ErrorAction Stop
                       Write-Host "   Added to sec00us-GoogleLicenseEnterpriseStandard-sec."
                   } else {
-                      Add-ADGroupMember -Identity $groupLicenseFrontline -Members $preSam -ErrorAction Stop
+                      Add-ADGroupMember -Identity "sec00us-GoogleLicenseFrontlineVault-sec" -Members $preSam -ErrorAction Stop
                       Write-Host "   Added to sec00us-GoogleLicenseFrontlineVault-sec."
                   }
               } catch {
